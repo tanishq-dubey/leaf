@@ -37,6 +37,7 @@ mod remote;
 mod render;
 mod rextheme;
 mod scheme;
+mod script;
 mod shape;
 mod spinner;
 mod stroke;

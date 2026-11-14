@@ -9,13 +9,14 @@ use std::sync::LazyLock;
 
 use image::RgbaImage;
 use mupdf::{
-    ColorParams, Colorspace, Device, Document, IRect, Matrix, MetadataName, Page, Pixmap,
+    ColorParams, Colorspace, Device, Document, IRect, Matrix, MetadataName, Page, Pixmap, TextChar,
     TextPageFlags, text_page::TextBlockType,
 };
 use regex::Regex;
 
 use crate::doc::{Doc, Source};
 use crate::memory;
+use crate::script::{self, Reading};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -107,6 +108,8 @@ const FORMULA_PIXELS_PER_POINT: f32 = 1.7;
 const FORMULA_GAP_ACROSS: f32 = 24.0;
 /// Pieces this close down belong together: a fraction's numerator, bar and denominator.
 const FORMULA_GAP_DOWN: f32 = 6.0;
+/// Lines of text this close down (in points) are drawn as one image.
+const LINE_GAP_DOWN: f32 = 4.0;
 /// Room (in points) left around a formula, so nothing at its edge is clipped.
 const FORMULA_PAD: f32 = 1.5;
 /// Text this close (in points) to a figure or table caption is in the figure or the table.
@@ -160,6 +163,8 @@ static MONO_FONT_NAME: LazyLock<Regex> = LazyLock::new(|| {
 /// line with a glyph from one has a symbol, operator or variable in it.
 static MATH_FONT_NAME: LazyLock<Regex> =
     LazyLock::new(|| re(r"(?i)\b(?:cmmi|cmsy|cmex|msam|msbm|eufm|eusm|mtmi|mtsy|mtex)|math|stix"));
+/// Fonts of stretchy pieces: big brackets and braces, roots, accents wider than their letter.
+static STRETCHY_FONT_NAME: LazyLock<Regex> = LazyLock::new(|| re(r"(?i)\b(?:cmex|mtex)"));
 /// An equation number set at the margin: "(3)", "(2.1)", "(A.4b)".
 static EQUATION_NUMBER: LazyLock<Regex> =
     LazyLock::new(|| re(r"^\(\s*(?:[A-Z]\.)?\d+(?:\.\d+)*[a-z]?\s*\)$"));
@@ -994,6 +999,14 @@ fn margins_of(pieces: &[Span], width: f32) -> Vec<f32> {
     margins
 }
 
+/// Whether text in `region` starts where a paragraph does: at a margin, or
+/// indented a little. Equations are centered or set further in.
+fn prose_at(margins: &[f32], region: Region, width: f32) -> bool {
+    margins
+        .iter()
+        .any(|&m| region.x0 >= m - MARGIN_SLACK && region.x0 < m + width * INDENT_SHARE)
+}
+
 /// Displayed equations on a page, to show as images: PDFs scatter one into
 /// runs of glyphs (a fraction's top and bottom, a brace, each operand) that no
 /// text extraction puts back together.
@@ -1022,11 +1035,7 @@ fn formula_regions(
     if margins.is_empty() {
         return Vec::new();
     }
-    let is_prose = |p: &Span| {
-        margins
-            .iter()
-            .any(|&m| p.region.x0 >= m - MARGIN_SLACK && p.region.x0 < m + width * INDENT_SHARE)
-    };
+    let is_prose = |p: &Span| prose_at(&margins, p.region, width);
     let in_figure = |p: &Span| figures.iter().any(|f| f.holds_middle_of(p.region));
     let loose: Vec<&Span> = pieces.iter().filter(|p| !in_figure(p)).collect();
 
@@ -1432,6 +1441,66 @@ fn render_region(
     Ok(rgba(&pixmap))
 }
 
+/// Images for lines of text that text can't hold, as `script` found. A line
+/// already in a figure or formula is in that image. Lines one under another
+/// share an image, so a run of them is one picture, not a strip of them.
+fn line_regions(lines: &[Region], covered: &[Region]) -> Vec<Region> {
+    let loose = lines
+        .iter()
+        .filter(|&&line| !covered.iter().any(|c| c.holds_middle_of(line)))
+        .map(|&region| Cluster {
+            region,
+            math: 1,
+            parts: 1,
+        })
+        .collect();
+
+    gather(loose, 0.0, LINE_GAP_DOWN)
+        .into_iter()
+        .map(|c| c.region)
+        .collect()
+}
+
+/// The lines left once the covered ones are taken out, in runs: what lies on
+/// either side of an image is not one paragraph.
+fn uncovered_runs(lines: Vec<Line>, covered: impl Fn(&Line) -> bool) -> Vec<Vec<Line>> {
+    let mut runs = Vec::new();
+    let mut run: Vec<Line> = Vec::new();
+    for line in lines {
+        if !covered(&line) {
+            run.push(line);
+            continue;
+        }
+        if !run.is_empty() {
+            runs.push(std::mem::take(&mut run));
+        }
+    }
+    if !run.is_empty() {
+        runs.push(run);
+    }
+    runs
+}
+
+/// A char of a line as `script` reads it.
+fn glyph_of(c: &TextChar, ch: char) -> script::Glyph {
+    let quad = c.quad();
+    let stretchy = c
+        .font()
+        .is_some_and(|font| STRETCHY_FONT_NAME.is_match(font.name()));
+    script::Glyph {
+        ch,
+        size: c.size(),
+        base: c.origin().y,
+        left: quad.ul.x.min(quad.ll.x),
+        right: quad.ur.x.max(quad.lr.x),
+        form: if stretchy {
+            script::Form::Stretchy
+        } else {
+            script::Form::Plain
+        },
+    }
+}
+
 /// Math operators and Greek letters: symbols prose rarely has.
 fn is_math_symbol(c: char) -> bool {
     matches!(c,
@@ -1468,6 +1537,8 @@ fn read_page(
     }
     let mut raw: Vec<(f32, Raw)> = Vec::new();
     let mut pieces: Vec<Span> = Vec::new();
+    // Lines with something text can't hold (a fraction, a script Unicode lacks), to draw instead.
+    let mut flagged: Vec<Region> = Vec::new();
     for block in text_page.blocks() {
         let b = block.bounds();
         match block.r#type() {
@@ -1477,9 +1548,11 @@ fn read_page(
                     let mut text = String::new();
                     let (mut mono, mut all, mut math) = (0usize, 0usize, 0usize);
                     let mut style: Option<(f32, String, bool, bool)> = None;
+                    let mut glyphs: Vec<script::Glyph> = Vec::new();
                     for c in line.chars() {
                         let Some(ch) = c.char() else { continue };
                         text.push(ch);
+                        glyphs.push(glyph_of(&c, ch));
                         if ch.is_whitespace() {
                             continue;
                         }
@@ -1510,13 +1583,22 @@ fn read_page(
                     let (size, name, bold, italic) =
                         style.unwrap_or((0.0, String::new(), false, false));
                     let lb = line.bounds();
+                    let at = Region {
+                        x0: lb.x0 - bounds.x0,
+                        y0: lb.y0 - bounds.y0,
+                        x1: lb.x1 - bounds.x0,
+                        y1: lb.y1 - bounds.y0,
+                    };
+                    let is_mono = all > 0 && mono as f32 >= all as f32 * MONO_SHARE;
+                    // Scripts are written as Unicode; a line that can't be goes to `flagged`.
+                    if !is_mono {
+                        match script::read(&glyphs) {
+                            Reading::Text(written) => text = written,
+                            Reading::Image => flagged.push(at),
+                        }
+                    }
                     pieces.push(Span {
-                        region: Region {
-                            x0: lb.x0 - bounds.x0,
-                            y0: lb.y0 - bounds.y0,
-                            x1: lb.x1 - bounds.x0,
-                            y1: lb.y1 - bounds.y0,
-                        },
+                        region: at,
                         content: Content::of(&text, math),
                     });
                     lines.push(Line {
@@ -1527,7 +1609,7 @@ fn read_page(
                         top: lb.y0 - bounds.y0,
                         left: (lb.x0 - bounds.x0) / width,
                         right: (lb.x1 - bounds.x0) / width,
-                        mono: all > 0 && mono as f32 >= all as f32 * MONO_SHARE,
+                        mono: is_mono,
                     });
                 }
                 if let Some(first) = lines.first() {
@@ -1565,8 +1647,16 @@ fn read_page(
         })
         .collect();
     let regions = figure_regions(&paths, &all_lines, width, height);
-    // Displayed equations show as images too; inline ones stay in their line.
-    let formulas = formula_regions(&pieces, &paths, &regions, width);
+    // Displayed equations show as images too. Math in a line of text stays
+    // text, unless text can't hold it: then its paragraph's line is an image.
+    let displayed = formula_regions(&pieces, &paths, &regions, width);
+    let covered: Vec<Region> = regions.iter().chain(&displayed).copied().collect();
+    let margins = margins_of(&pieces, width);
+    flagged.retain(|&line| prose_at(&margins, line, width));
+    let formulas: Vec<Region> = displayed
+        .into_iter()
+        .chain(line_regions(&flagged, &covered))
+        .collect();
     let in_figure = |line: &Line| {
         regions
             .iter()
@@ -1580,9 +1670,8 @@ fn read_page(
     for (top, block) in raw {
         match block {
             Raw::Text(lines) => {
-                let lines: Vec<Line> = lines.into_iter().filter(|l| !in_figure(l)).collect();
-                if let Some(first) = lines.first() {
-                    placed.push((first.top, Block::Text(lines)));
+                for run in uncovered_runs(lines, in_figure) {
+                    placed.push((run[0].top, Block::Text(run)));
                 }
             }
             Raw::Image(image, w, h) => {
@@ -2503,6 +2592,66 @@ mod tests {
         };
 
         assert_eq!(formula_size(region), (170, 17));
+    }
+
+    fn row(top: f32) -> Region {
+        Region {
+            x0: 72.0,
+            y0: top,
+            x1: 540.0,
+            y1: top + 11.0,
+        }
+    }
+
+    #[test]
+    fn lines_one_under_another_share_an_image() {
+        let lines = [row(100.0), row(114.0), row(200.0)];
+
+        let found = line_regions(&lines, &[]);
+
+        assert_eq!(found.len(), 2);
+        assert_eq!((found[0].y0, found[0].y1), (100.0, 125.0));
+        assert_eq!((found[1].y0, found[1].y1), (200.0, 211.0));
+    }
+
+    #[test]
+    fn a_line_in_a_figure_or_formula_needs_no_image_of_its_own() {
+        let lines = [row(100.0), row(300.0)];
+        let covered = [Region {
+            x0: 50.0,
+            y0: 90.0,
+            x1: 560.0,
+            y1: 130.0,
+        }];
+
+        let found = line_regions(&lines, &covered);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].y0, 300.0);
+    }
+
+    #[test]
+    fn lines_either_side_of_a_covered_one_are_separate_runs() {
+        let lines = vec![
+            line("one", 10.0),
+            line("two", 24.0),
+            line("covered", 38.0),
+            line("three", 52.0),
+        ];
+
+        let runs = uncovered_runs(lines, |l| l.text == "covered");
+
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].len(), 2);
+        assert_eq!(runs[1][0].text, "three");
+    }
+
+    #[test]
+    fn lines_with_nothing_covered_stay_one_run() {
+        let lines = vec![line("one", 10.0), line("two", 24.0)];
+
+        assert_eq!(uncovered_runs(lines, |_| false).len(), 1);
+        assert!(uncovered_runs(Vec::new(), |_| false).is_empty());
     }
 }
 
