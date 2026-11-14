@@ -72,7 +72,7 @@ Links that serve a PDF (checked by content type, so `/pdf/2401.00001` works) ope
 
 Windows at least 100×24 show one PDF page per screen; smaller ones scroll through all pages, with the page number between them.
 
-PDFs are converted to markdown (headings from font size, paragraphs rejoined, running headers dropped) with embedded images shown inline. Articles go through Readability; links show their URL.
+PDFs are converted to markdown (headings from font size, paragraphs rejoined, running headers dropped) with embedded images shown inline. Displayed equations are drawn as images too, set apart from the text like the page sets them; math inside a line of text stays text. Articles go through Readability; links show their URL.
 
 Markdown files (`.md`, `.markdown`) show as written, with GitHub's extensions: tables, task lists, strikethrough, footnotes and alerts (`> [!NOTE]`), plus definition lists and math (kept as source). Front matter is hidden, HTML blocks such as a README's centered logo are read as markdown, and images next to the file show inline (PNG, JPEG, GIF, WebP).
 

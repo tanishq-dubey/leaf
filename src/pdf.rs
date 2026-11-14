@@ -99,6 +99,32 @@ const FIGURE_GAP: f32 = 8.0;
 const MAX_LABEL_LENGTH: usize = 60;
 /// Labels this close (in points) to a drawing's shapes are part of it; a caption sits further off.
 const LABEL_REACH: f32 = 4.0;
+/// Pixels a point of page is drawn at in a formula, so it comes out as big as
+/// the text around it: a 466 point text column is about 100 columns of 8 pixels.
+const FORMULA_PIXELS_PER_POINT: f32 = 1.7;
+/// Pieces of a formula this close across (in points) belong together: the
+/// operator, the operands, a brace and what it holds.
+const FORMULA_GAP_ACROSS: f32 = 24.0;
+/// Pieces this close down belong together: a fraction's numerator, bar and denominator.
+const FORMULA_GAP_DOWN: f32 = 6.0;
+/// Room (in points) left around a formula, so nothing at its edge is clipped.
+const FORMULA_PAD: f32 = 1.5;
+/// Text this close (in points) to a figure or table caption is in the figure or the table.
+const CAPTION_REACH: f32 = 24.0;
+/// Thicker shapes (in points) than this are not rules.
+const MAX_RULE_THICKNESS: f32 = 1.5;
+/// More separate pieces than this on one row are a table, not equations side by side.
+const MAX_FORMULAS_PER_ROW: usize = 3;
+/// Lines at least this share of the page wide are body text.
+const BODY_SHARE: f32 = 0.35;
+/// Body lines starting at about the same place at least this many times mark a text margin.
+const MIN_BODY_LINES: usize = 3;
+/// Left edges this close (in points) are the same margin.
+const MARGIN_SLACK: f32 = 3.0;
+/// Text starting less than this share of the page past a margin is a paragraph's
+/// (indent, list item); equations are centered or set further in.
+const INDENT_SHARE: f32 = 0.08;
+
 /// A line whose middle is this close to the page's middle (as a share of the width) is centered.
 const CENTER_SLACK: f32 = 0.03;
 /// Lines narrower than this share of a full line can show they are centered; full lines are centered trivially.
@@ -130,6 +156,13 @@ static ITALIC_FONT_NAME: LazyLock<Regex> = LazyLock::new(|| re(r"(?i)italic|obli
 static MONO_FONT_NAME: LazyLock<Regex> = LazyLock::new(|| {
     re(r"(?i)mono|courier|consol|menlo|monaco|inconsolata|typewriter|code|cmtt|txtt|lmtt")
 });
+/// Fonts math is set in. Body text and its italics aren't among them, so a
+/// line with a glyph from one has a symbol, operator or variable in it.
+static MATH_FONT_NAME: LazyLock<Regex> =
+    LazyLock::new(|| re(r"(?i)\b(?:cmmi|cmsy|cmex|msam|msbm|eufm|eusm|mtmi|mtsy|mtex)|math|stix"));
+/// An equation number set at the margin: "(3)", "(2.1)", "(A.4b)".
+static EQUATION_NUMBER: LazyLock<Regex> =
+    LazyLock::new(|| re(r"^\(\s*(?:[A-Z]\.)?\d+(?:\.\d+)*[a-z]?\s*\)$"));
 /// A page label like "xiv | Preface", "Chapter 3 | 57" or a bare "57".
 static PAGE_LABEL: LazyLock<Regex> = LazyLock::new(|| {
     let number = r"(?:\d+|m{0,3}(?:cm|cd|d?c{0,3})(?:xc|xl|l?x{0,3})(?:ix|iv|v?i{0,3}))";
@@ -764,6 +797,24 @@ impl Region {
         let (x, y) = ((line.x0 + line.x1) / 2.0, (line.y0 + line.y1) / 2.0);
         x >= self.x0 && x <= self.x1 && y >= self.y0 && y <= self.y1
     }
+
+    /// Whether `other` is at most `across` away sideways and `down` away vertically.
+    fn within(self, other: Region, across: f32, down: f32) -> bool {
+        self.x0 - across <= other.x1
+            && other.x0 - across <= self.x1
+            && self.y0 - down <= other.y1
+            && other.y0 - down <= self.y1
+    }
+
+    /// This region grown by `by` on every side; shrunk if negative.
+    fn grown(self, by: f32) -> Region {
+        Region {
+            x0: self.x0 - by,
+            y0: self.y0 - by,
+            x1: self.x1 + by,
+            y1: self.y1 + by,
+        }
+    }
 }
 
 /// Vector drawings (diagrams, charts) on a page, to show as images. Shapes
@@ -852,6 +903,197 @@ fn figure_regions(paths: &[Region], lines: &[Line], width: f32, height: f32) -> 
                 .iter()
                 .any(|&(line, len)| len > MAX_LABEL_LENGTH && line.overlaps(*region))
         })
+        .collect()
+}
+
+/// What a run of text on a page holds, for finding formulas.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Content {
+    /// Has a glyph from a math font, or a math symbol.
+    Math,
+    /// An equation number: "(3.1)".
+    Number,
+    /// A figure or table caption.
+    Caption,
+    Plain,
+}
+
+impl Content {
+    fn of(text: &str, math_glyphs: usize) -> Content {
+        if CAPTION.is_match(text) {
+            return Content::Caption;
+        }
+        if math_glyphs > 0 {
+            return Content::Math;
+        }
+        if EQUATION_NUMBER.is_match(text.trim()) {
+            return Content::Number;
+        }
+        Content::Plain
+    }
+}
+
+/// A run of text and where it sits on the page, in points.
+#[derive(Debug, Clone, Copy)]
+struct Span {
+    region: Region,
+    content: Content,
+}
+
+/// Pieces gathered into one region, with how many of them have math.
+#[derive(Debug, Clone, Copy)]
+struct Cluster {
+    region: Region,
+    math: usize,
+    parts: usize,
+}
+
+/// Joins clusters at most `across` and `down` apart, until none are.
+fn gather(mut clusters: Vec<Cluster>, across: f32, down: f32) -> Vec<Cluster> {
+    'merge: loop {
+        for i in 0..clusters.len() {
+            for j in i + 1..clusters.len() {
+                if !clusters[i].region.within(clusters[j].region, across, down) {
+                    continue;
+                }
+                let other = clusters.remove(j);
+                clusters[i] = Cluster {
+                    region: clusters[i].region.union(other.region),
+                    math: clusters[i].math + other.math,
+                    parts: clusters[i].parts + other.parts,
+                };
+                continue 'merge;
+            }
+        }
+        return clusters;
+    }
+}
+
+/// Where body text starts on a page: left edges that long lines share. A page
+/// of two columns has two; a page with too little text to tell has none.
+fn margins_of(pieces: &[Span], width: f32) -> Vec<f32> {
+    let mut edges: Vec<f32> = pieces
+        .iter()
+        .filter(|p| p.region.width() >= width * BODY_SHARE)
+        .map(|p| p.region.x0)
+        .collect();
+    edges.sort_by(f32::total_cmp);
+
+    let mut margins = Vec::new();
+    let mut at = 0;
+    while at < edges.len() {
+        let end = edges[at..]
+            .iter()
+            .position(|&edge| edge - edges[at] > MARGIN_SLACK)
+            .map_or(edges.len(), |n| at + n);
+        if end - at >= MIN_BODY_LINES {
+            margins.push(edges[at]);
+        }
+        at = end;
+    }
+    margins
+}
+
+/// Displayed equations on a page, to show as images: PDFs scatter one into
+/// runs of glyphs (a fraction's top and bottom, a brace, each operand) that no
+/// text extraction puts back together.
+///
+///     |  Let the cost of S be
+///     |
+///     |                  w(S)
+///     |        c(S) =   ------ ,                       (3.1)
+///     |                  |S|
+///     |
+///     |  where w is ...
+///     ^ body text starts here; the equation is set in from it
+///
+/// Text set apart from the margins that has math in it is an equation; what
+/// shares its row, equation number included, goes in the same image. Inline
+/// math stays in its line, and a row of many pieces is a table, not an equation.
+/// `paths` are what's drawn on the page: a diagram's boxes and arrows make
+/// the text in them a figure, not an equation.
+fn formula_regions(
+    pieces: &[Span],
+    paths: &[Region],
+    figures: &[Region],
+    width: f32,
+) -> Vec<Region> {
+    let margins = margins_of(pieces, width);
+    if margins.is_empty() {
+        return Vec::new();
+    }
+    let is_prose = |p: &Span| {
+        margins
+            .iter()
+            .any(|&m| p.region.x0 >= m - MARGIN_SLACK && p.region.x0 < m + width * INDENT_SHARE)
+    };
+    let in_figure = |p: &Span| figures.iter().any(|f| f.holds_middle_of(p.region));
+    let loose: Vec<&Span> = pieces.iter().filter(|p| !in_figure(p)).collect();
+
+    let cluster = |p: &&Span| Cluster {
+        region: p.region,
+        math: usize::from(p.content == Content::Math),
+        parts: 1,
+    };
+    let set_apart: Vec<Cluster> = loose
+        .iter()
+        .filter(|p| p.content != Content::Number && !is_prose(p))
+        .map(cluster)
+        .collect();
+    let equations = gather(set_apart, FORMULA_GAP_ACROSS, FORMULA_GAP_DOWN);
+
+    // A row is one image: equations side by side, and the number at the margin.
+    let numbers = loose
+        .iter()
+        .filter(|p| p.content == Content::Number)
+        .map(|p| Cluster {
+            region: p.region,
+            math: 0,
+            parts: 0,
+        });
+    let rows = gather(
+        equations
+            .iter()
+            .map(|e| Cluster { parts: 1, ..*e })
+            .chain(numbers)
+            .collect(),
+        f32::INFINITY,
+        0.0,
+    );
+    let captions: Vec<Region> = loose
+        .iter()
+        .filter(|p| p.content == Content::Caption)
+        .map(|p| p.region)
+        .collect();
+    let prose: Vec<Region> = loose
+        .iter()
+        .filter(|p| is_prose(p))
+        .map(|p| p.region)
+        .collect();
+
+    // A fraction bar or a root's top is a rule inside the equation's width.
+    // Any other shape near the text makes it a label in a diagram.
+    let is_rule = |path: &Region, row: Region| {
+        path.height() < MAX_RULE_THICKNESS
+            && path.x0 >= row.x0 - FORMULA_PAD
+            && path.x1 <= row.x1 + FORMULA_PAD
+            && path.overlaps(row)
+    };
+
+    rows.into_iter()
+        .filter(|row| row.math > 0 && row.parts <= MAX_FORMULAS_PER_ROW)
+        .filter(|row| {
+            let inside = row.region.grown(-FORMULA_PAD);
+            !prose.iter().any(|p| p.overlaps(inside))
+                && !figures.iter().any(|f| f.overlaps(row.region))
+                && !captions
+                    .iter()
+                    .any(|c| row.region.within(*c, f32::INFINITY, CAPTION_REACH))
+                && !paths.iter().any(|path| {
+                    row.region.within(*path, FIGURE_GAP, FIGURE_GAP) && !is_rule(path, row.region)
+                })
+        })
+        .map(|row| row.region.grown(FORMULA_PAD))
         .collect()
 }
 
@@ -1116,6 +1358,12 @@ fn region_size(region: Region) -> (f32, u32, u32) {
     )
 }
 
+/// Pixel size a formula is shown at: as big as the text around it, however small.
+fn formula_size(region: Region) -> (u32, u32) {
+    let pixels = |points: f32| ((points * FORMULA_PIXELS_PER_POINT).round() as u32).max(1);
+    (pixels(region.width()), pixels(region.height()))
+}
+
 /// Opaque RGBA pixels of an RGB pixmap with alpha.
 fn rgba(pixmap: &Pixmap) -> Option<RgbaImage> {
     let (w, h, n) = (pixmap.width(), pixmap.height(), pixmap.n() as usize);
@@ -1184,6 +1432,21 @@ fn render_region(
     Ok(rgba(&pixmap))
 }
 
+/// Math operators and Greek letters: symbols prose rarely has.
+fn is_math_symbol(c: char) -> bool {
+    matches!(c,
+        '\u{0391}'..='\u{03C9}' | '\u{2200}'..='\u{22FF}' | '\u{27C0}'..='\u{27EF}' | '\u{2980}'..='\u{2AFF}')
+}
+
+/// Puts the image `id` among `placed` at the height `region` sits on the page.
+fn insert_at(placed: &mut Vec<(f32, Block)>, region: Region, id: String) {
+    let at = placed
+        .iter()
+        .position(|(top, _)| *top >= region.y0)
+        .unwrap_or(placed.len());
+    placed.insert(at, (region.y0, Block::Image(id)));
+}
+
 /// Reads one page into blocks, registering the images it shows.
 fn read_page(
     document: &Document,
@@ -1204,6 +1467,7 @@ fn read_page(
         Image(mupdf::Image, f32, f32),
     }
     let mut raw: Vec<(f32, Raw)> = Vec::new();
+    let mut pieces: Vec<Span> = Vec::new();
     for block in text_page.blocks() {
         let b = block.bounds();
         match block.r#type() {
@@ -1211,7 +1475,7 @@ fn read_page(
                 let mut lines = Vec::new();
                 for line in block.lines() {
                     let mut text = String::new();
-                    let (mut mono, mut all) = (0usize, 0usize);
+                    let (mut mono, mut all, mut math) = (0usize, 0usize, 0usize);
                     let mut style: Option<(f32, String, bool, bool)> = None;
                     for c in line.chars() {
                         let Some(ch) = c.char() else { continue };
@@ -1220,9 +1484,15 @@ fn read_page(
                             continue;
                         }
                         all += 1;
+                        if is_math_symbol(ch) {
+                            math += 1;
+                        }
                         if let Some(font) = c.font() {
                             if font.is_monospaced() || MONO_FONT_NAME.is_match(font.name()) {
                                 mono += 1;
+                            }
+                            if MATH_FONT_NAME.is_match(font.name()) {
+                                math += 1;
                             }
                             if style.is_none() {
                                 style = Some((
@@ -1240,6 +1510,15 @@ fn read_page(
                     let (size, name, bold, italic) =
                         style.unwrap_or((0.0, String::new(), false, false));
                     let lb = line.bounds();
+                    pieces.push(Span {
+                        region: Region {
+                            x0: lb.x0 - bounds.x0,
+                            y0: lb.y0 - bounds.y0,
+                            x1: lb.x1 - bounds.x0,
+                            y1: lb.y1 - bounds.y0,
+                        },
+                        content: Content::of(&text, math),
+                    });
                     lines.push(Line {
                         text,
                         size: round_half(size),
@@ -1286,9 +1565,12 @@ fn read_page(
         })
         .collect();
     let regions = figure_regions(&paths, &all_lines, width, height);
+    // Displayed equations show as images too; inline ones stay in their line.
+    let formulas = formula_regions(&pieces, &paths, &regions, width);
     let in_figure = |line: &Line| {
         regions
             .iter()
+            .chain(&formulas)
             .any(|r| r.holds_middle_of(Region::of_line(line, width)))
     };
 
@@ -1335,11 +1617,21 @@ fn read_page(
                 height,
             },
         );
-        let at = placed
-            .iter()
-            .position(|(top, _)| *top >= region.y0)
-            .unwrap_or(placed.len());
-        placed.insert(at, (region.y0, Block::Image(id)));
+        insert_at(&mut placed, region, id);
+    }
+    for (n, region) in formulas.into_iter().enumerate() {
+        let id = format!("p{}-formula-{}", i + 1, n + 1);
+        let (width, height) = formula_size(region);
+        images.insert(
+            id.clone(),
+            PdfImage::Drawing {
+                page: i,
+                region,
+                width,
+                height,
+            },
+        );
+        insert_at(&mut placed, region, id);
     }
     Ok(placed.into_iter().map(|(_, b)| b).collect())
 }
@@ -2043,6 +2335,174 @@ mod tests {
             ),
             "{out}"
         );
+    }
+
+    const PAGE_WIDTH: f32 = 612.0;
+
+    fn span(x0: f32, y0: f32, x1: f32, y1: f32, content: Content) -> Span {
+        Span {
+            region: Region { x0, y0, x1, y1 },
+            content,
+        }
+    }
+
+    /// Body text, so the page has margins: `lines` full lines from the top.
+    fn text_lines(lines: usize) -> Vec<Span> {
+        (0..lines)
+            .map(|n| {
+                let top = n as f32 * 14.0;
+                span(72.0, top, 540.0, top + 11.0, Content::Plain)
+            })
+            .collect()
+    }
+
+    fn formulas(pieces: &[Span], paths: &[Region]) -> Vec<Region> {
+        formula_regions(pieces, paths, &[], PAGE_WIDTH)
+    }
+
+    #[test]
+    fn content_is_told_by_its_glyphs_and_shape() {
+        assert_eq!(Content::of("x ∈ S", 1), Content::Math);
+        assert_eq!(Content::of("(3.1)", 0), Content::Number);
+        assert_eq!(Content::of("(A.4b)", 0), Content::Number);
+        assert_eq!(Content::of("Figure 2: Why it works. ", 3), Content::Caption);
+        assert_eq!(Content::of("same,", 0), Content::Plain);
+        assert!(is_math_symbol('∪') && is_math_symbol('λ'));
+        assert!(!is_math_symbol('a') && !is_math_symbol('→'));
+        assert!(MATH_FONT_NAME.is_match("TEEKKJ+CMSY10"));
+        assert!(MATH_FONT_NAME.is_match("Cambria Math"));
+        assert!(!MATH_FONT_NAME.is_match("PWMGXQ+URWPalladioL-Roma"));
+    }
+
+    #[test]
+    fn a_centered_equation_with_its_number_is_one_formula() {
+        let mut page = text_lines(5);
+        page.push(span(200.0, 130.0, 400.0, 144.0, Content::Math));
+        page.push(span(519.0, 131.0, 540.0, 142.0, Content::Number));
+
+        let found = formulas(&page, &[]);
+
+        assert_eq!(found.len(), 1);
+        assert!(found[0].x0 < 200.0 && found[0].x1 > 540.0);
+        assert!(found[0].y0 < 130.0 && found[0].y1 > 144.0);
+    }
+
+    #[test]
+    fn math_in_a_line_of_text_stays_text() {
+        let mut page = text_lines(5);
+        page.push(span(72.0, 130.0, 540.0, 141.0, Content::Math));
+        // The short last line of a paragraph, and an indented first line.
+        page.push(span(72.0, 144.0, 187.0, 155.0, Content::Math));
+        page.push(span(90.0, 158.0, 500.0, 169.0, Content::Math));
+
+        assert!(formulas(&page, &[]).is_empty());
+    }
+
+    #[test]
+    fn the_parts_of_a_fraction_are_one_formula() {
+        let mut page = text_lines(5);
+        page.push(span(230.0, 100.0, 250.0, 110.0, Content::Math));
+        page.push(span(230.0, 112.0, 250.0, 122.0, Content::Math));
+        page.push(span(252.0, 104.0, 280.0, 118.0, Content::Math));
+
+        let found = formulas(&page, &[]);
+
+        assert_eq!(found.len(), 1);
+        assert!(found[0].y0 < 100.0 && found[0].y1 > 122.0);
+    }
+
+    #[test]
+    fn a_fraction_bar_is_part_of_the_formula_but_a_box_is_a_diagram() {
+        let mut page = text_lines(5);
+        page.push(span(230.0, 100.0, 250.0, 110.0, Content::Math));
+        page.push(span(230.0, 113.0, 250.0, 123.0, Content::Math));
+        let bar = Region {
+            x0: 229.0,
+            y0: 111.0,
+            x1: 251.0,
+            y1: 111.5,
+        };
+        let boxed = Region {
+            x0: 215.0,
+            y0: 95.0,
+            x1: 265.0,
+            y1: 128.0,
+        };
+
+        assert_eq!(formulas(&page, &[bar]).len(), 1);
+        assert!(formulas(&page, &[boxed]).is_empty());
+    }
+
+    #[test]
+    fn labels_by_a_caption_are_a_figure() {
+        let mut page = text_lines(5);
+        page.push(span(230.0, 100.0, 330.0, 112.0, Content::Math));
+        page.push(span(72.0, 125.0, 540.0, 136.0, Content::Caption));
+
+        assert!(formulas(&page, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_row_of_many_cells_is_a_table() {
+        let mut page = text_lines(5);
+        for n in 0..5 {
+            let left = 150.0 + n as f32 * 70.0;
+            page.push(span(left, 100.0, left + 30.0, 112.0, Content::Math));
+        }
+
+        assert!(formulas(&page, &[]).is_empty());
+    }
+
+    #[test]
+    fn equations_side_by_side_share_an_image() {
+        let mut page = text_lines(5);
+        page.push(span(154.0, 100.0, 260.0, 112.0, Content::Math));
+        page.push(span(315.0, 100.0, 455.0, 112.0, Content::Math));
+
+        let found = formulas(&page, &[]);
+
+        assert_eq!(found.len(), 1);
+        assert!(found[0].x0 < 154.0 && found[0].x1 > 455.0);
+    }
+
+    #[test]
+    fn a_page_without_body_text_has_no_formulas() {
+        let page = [span(230.0, 100.0, 330.0, 112.0, Content::Math)];
+
+        assert!(formulas(&page, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_second_column_has_its_own_margin() {
+        let mut page: Vec<Span> = (0..5)
+            .flat_map(|n| {
+                let top = n as f32 * 14.0;
+                [
+                    span(72.0, top, 290.0, top + 11.0, Content::Plain),
+                    span(320.0, top, 540.0, top + 11.0, Content::Plain),
+                ]
+            })
+            .collect();
+        // A line of the right column that has math in it, and a centered equation in it.
+        page.push(span(320.0, 130.0, 540.0, 141.0, Content::Math));
+        page.push(span(390.0, 160.0, 470.0, 172.0, Content::Math));
+
+        let found = formulas(&page, &[]);
+
+        assert_eq!(found.len(), 1);
+        assert!(found[0].x0 > 380.0);
+    }
+
+    #[test]
+    fn a_formula_is_shown_as_big_as_its_text() {
+        let region = Region {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 100.0,
+            y1: 10.0,
+        };
+
+        assert_eq!(formula_size(region), (170, 17));
     }
 }
 
